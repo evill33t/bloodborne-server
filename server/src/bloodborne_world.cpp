@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -31,6 +32,7 @@
 #include <io.h>
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -91,7 +93,7 @@ QString Hex(quint64 value) {
 
 // Phase 11: what was written reaches the disk, not only the system's cache (a power cut or a
 // crash of the PC keeps it).
-bool SyncToDisk(QFile& file) {
+bool SyncToDisk(QFileDevice& file) {
     if (!file.flush()) {
         return false;
     }
@@ -100,6 +102,27 @@ bool SyncToDisk(QFile& file) {
     return handle != INVALID_HANDLE_VALUE && FlushFileBuffers(handle) != 0;
 #else
     return fsync(file.handle()) == 0;
+#endif
+}
+
+
+// A successful rename is not yet a durable directory entry. Sync both the mailbox directory
+// and its parent: the first reward may have just created the mailbox directory itself.
+bool SyncDirectory(const QString& path) {
+#ifdef Q_OS_WIN
+    const HANDLE handle = CreateFileW(reinterpret_cast<const wchar_t*>(path.utf16()),
+        GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    const bool ok = FlushFileBuffers(handle) != 0;
+    CloseHandle(handle);
+    return ok;
+#else
+    const int fd = open(QFile::encodeName(path).constData(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return false;
+    const bool ok = fsync(fd) == 0;
+    close(fd);
+    return ok;
 #endif
 }
 
@@ -219,25 +242,40 @@ bool WorldStore::Compact(const bbcoop::StoredWorld& world, const QDate& today) {
 
 std::optional<bbcoop::StoredTrades> WorldStore::LoadTrades() const {
     QFile file{QDir{folder}.filePath(TradesFile)};
-    if (!file.open(QIODevice::ReadOnly)) {
+    if (!QFileInfo{file}.isFile() || !file.open(QIODevice::ReadOnly)) {
         return std::nullopt;
     }
     const QByteArray bytes = file.readAll();
     bbcoop::StoredTrades trades;
-    if (!trades.ParseFromArray(bytes.constData(), static_cast<int>(bytes.size()))) {
+    if (file.error() != QFileDevice::NoError ||
+        !trades.ParseFromArray(bytes.constData(), static_cast<int>(bytes.size())) ||
+        trades.next_id() == 0 || trades.next_id() >= InvasionRewardGrantBit) {
         return std::nullopt;
     }
     return trades;
 }
 
-bool WorldStore::SaveTrades(const bbcoop::StoredTrades& trades) {
-    QDir{}.mkpath(folder);
+bool WorldStore::SaveTrades(const bbcoop::StoredTrades& trades, const TradesWriteCheck& check) {
+    const auto proceed = [&](TradesWritePoint point) { return !check || check(point); };
+    if (!QDir{}.mkpath(folder)) return false;
     QSaveFile file{QDir{folder}.filePath(TradesFile)};
-    if (!file.open(QIODevice::WriteOnly)) {
+    file.setDirectWriteFallback(false);
+    const QByteArray bytes = Serialized(trades);
+    if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() ||
+        !proceed(TradesWritePoint::BeforeFileSync) || !SyncToDisk(file) ||
+        !proceed(TradesWritePoint::BeforeRename) || !file.commit()) {
         return false;
     }
-    file.write(Serialized(trades));
-    return file.commit();
+    if (!proceed(TradesWritePoint::AfterRename)) return false;
+    // Include ancestors that mkpath (or an older queued world snapshot) just created.
+    QString directory = QDir{folder}.absolutePath();
+    for (;;) {
+        if (!SyncDirectory(directory)) return false;
+        const QString parent = QFileInfo{directory}.dir().absolutePath();
+        if (parent == directory) break;
+        directory = parent;
+    }
+    return proceed(TradesWritePoint::AfterDirectorySync);
 }
 
 struct WorldWriter::State {
@@ -417,6 +455,25 @@ void WorldWriter::SaveTrades(const QString& folder, bbcoop::StoredTrades trades)
             s.Log(QStringLiteral("world store %1: the trades could not write").arg(folder));
         }
     });
+}
+
+bool WorldWriter::SaveTradesDurable(const QString& folder, bbcoop::StoredTrades trades,
+                                    WorldStore::TradesWriteCheck check) {
+    if (state->abandon) return false;
+    auto completion = std::make_shared<std::promise<bool>>();
+    auto done = completion->get_future();
+    state->Push(folder, [folder, trades = std::move(trades), check = std::move(check),
+                         completion](State& s) {
+        const bool ok = WorldStore{folder}.SaveTrades(trades, check);
+        if (!ok) s.Log(QStringLiteral("world store %1: durable trades write failed").arg(folder));
+        completion->set_value(ok);
+    });
+    // The same FIFO queue owns every trades.pb write, including ordinary asynchronous saves.
+    // No older queued snapshot can overwrite this acknowledged completion afterwards.
+    while (done.wait_for(std::chrono::milliseconds{10}) != std::future_status::ready) {
+        if (state->abandon) return false;
+    }
+    return done.get();
 }
 
 void WorldWriter::SaveTeamWorld(const QString& dir, bbcoop::TeamWorld world, const QDate& today) {
@@ -1053,12 +1110,10 @@ void Service::Take(Member& member, const bbcoop::Envelope& envelope, qint64 now_
     if (envelope.has_trade_granted() &&
         (envelope.trade_granted().id() & InvasionRewardGrantBit) != 0) {
         if (member.invasion_rewards && !member.lobby.empty()) {
-            const QString name = RewardFolder(member);
-            if (worlds.contains(name) || (!folder.isEmpty() && LoadWorld(name, now_ms, result))) {
-                PartyWorld& mailbox = worlds.at(name);
-                DeliverRewards(member, mailbox,
-                               mailbox.trades.Granted(member.lobby, envelope.trade_granted().id()),
-                               now_ms, result);
+            if (PartyWorld* mailbox = RewardMailbox(member, false, now_ms, result)) {
+                TradeDesk staged = mailbox->trades;
+                auto ack = staged.Granted(member.lobby, envelope.trade_granted().id());
+                DeliverRewards(member, *mailbox, std::move(staged), std::move(ack), now_ms, result);
             }
         }
         return;
@@ -3051,26 +3106,29 @@ void Service::EndInvasion(const QString& world, bbcoop::InvasionEnd::Reason reas
     if (found == invasions.end()) {
         return;
     }
-    const Invasion invasion = std::move(found->second);
-    invasions.erase(found); // retire first: a repeated end/death report cannot mint another grant
+    const Invasion invasion = found->second;
+    // A failed persistence attempt publishes nothing and keeps the frozen entitlement alive.
+    // A repeated dead Vitals can retry; successful publication retires before another message.
+
     if (invasion.joined) {
         for (auto& [key, member] : members) {
             if (reason == bbcoop::InvasionEnd::INVADER_DIED && member.party == world &&
                 member.name == invasion.target && !member.hostile) {
-                RewardInvasion(member, invasion.id, invasion.invader_name,
-                               InvasionVictoryEchoes(invasion.invader_level, false),
-                               invasion.target_covenant, now_ms, result);
+                if (!RewardInvasion(member, invasion.id, invasion.invader_name,
+                                    InvasionVictoryEchoes(invasion.invader_level, false),
+                                    invasion.target_covenant, now_ms, result)) return;
                 break;
             }
             if (reason == bbcoop::InvasionEnd::TARGET_KILLED && killed_by_invader &&
                 member.key == invasion.invader) {
-                RewardInvasion(member, invasion.id, invasion.target,
-                               InvasionVictoryEchoes(invasion.target_level, true),
-                               invasion.invader_covenant, now_ms, result);
+                if (!RewardInvasion(member, invasion.id, invasion.target,
+                                    InvasionVictoryEchoes(invasion.target_level, true),
+                                    invasion.invader_covenant, now_ms, result)) return;
                 break;
             }
         }
     }
+    invasions.erase(found); // durable grant/counter first; duplicate end/death cannot pay again
     bbcoop::Envelope envelope;
     envelope.mutable_invasion_end()->set_id(invasion.id);
     envelope.mutable_invasion_end()->set_reason(reason);
@@ -3108,6 +3166,9 @@ void Service::CheckInvasion(const PartyWorld& world, const Member& member,
         return;
     }
     if (member.name == found->second.target && vitals.vital() == 3) { // Vital: dead
+        if (const auto winner = members.find(found->second.invader);
+            vitals.killed_by_invader() && winner != members.end() &&
+            now_ms < winner->second.reward_retry_ms) return;
         result.log.append(
             QStringLiteral("invasions: %1 died%2")
                 .arg(QString::fromStdString(member.name),
@@ -3129,15 +3190,49 @@ QString Service::RewardFolder(const Member& member) const {
     return FolderOf(QByteArray{"invasion-rewards:"} + member.online_id.toHex());
 }
 
-void Service::DeliverRewards(Member& member, PartyWorld& mailbox, TradeDesk::Result grants,
-                             qint64 now_ms, Result& result) {
+Service::PartyWorld* Service::RewardMailbox(Member& member, bool create, qint64 now_ms,
+                                                Result& result) {
+    if (now_ms < member.reward_retry_ms) return nullptr;
+    const QString name = RewardFolder(member);
+    if (auto found = worlds.find(name); found != worlds.end() && found->second.reward_mailbox)
+        return &found->second;
+    const QString path = QDir{folder}.filePath(name);
+    if (writer && writer->Pending(path)) writer->Drain();
+    auto store = folder.isEmpty() ? nullptr : std::make_unique<WorldStore>(path);
+    const auto stored = store ? store->LoadTrades() : std::nullopt;
+    // A present unreadable ledger is never an empty ledger: resetting next_id could replay an
+    // already committed award under an old id. Keep it intact for operator recovery.
+    if (store && QFileInfo::exists(QDir{path}.filePath(TradesFile)) && !stored) {
+        member.reward_retry_ms = now_ms + 1000;
+        result.log.append(QStringLiteral("invasion rewards: unreadable mailbox, refusing payments"));
+        return nullptr;
+    }
+    if (!stored && !create) return nullptr;
+    if (!RoomFor(name, now_ms, result)) return nullptr;
+    PartyWorld& mailbox = worlds[name];
+    mailbox.name = name;
+    mailbox.store = std::move(store);
+    mailbox.reward_mailbox = true;
+    if (stored) mailbox.trades.Restore(*stored, now_ms);
+    return &mailbox;
+}
+
+bool Service::DeliverRewards(Member& member, PartyWorld& mailbox, TradeDesk staged,
+                             TradeDesk::Result grants, qint64 now_ms, Result& result) {
+    // Include unchanged resumes: they must never expose a state whose durability is uncertain.
+    // Staging keeps a failed ACK from erasing the last confirmed in-memory pending grant.
+    if (mailbox.store && !writer->SaveTradesDurable(mailbox.store->Folder(), staged.Stored())) {
+        member.reward_retry_ms = now_ms + 1000;
+        result.log.append(QStringLiteral("invasion rewards: persistence failed; no grant published"));
+        return false;
+    }
+    member.reward_retry_ms = 0;
+    mailbox.trades = std::move(staged);
     for (const TradeDesk::Send& send : grants.sends) {
         const bool needs_covenant = send.envelope.has_trade_grant() &&
             std::ranges::any_of(send.envelope.trade_grant().items(), [](const auto& item) {
                 return item.kind() == static_cast<u32>(TradeItemKind::Goods);
             });
-        // A legacy reward client cannot validate the extended shape. Keep the whole durable
-        // grant for its next capable login rather than partially paying or dropping the Dreg.
         if (send.to == member.lobby && member.invasion_rewards &&
             (!needs_covenant || member.covenant_rewards)) {
             SendTo(member, send.envelope, now_ms);
@@ -3147,40 +3242,31 @@ void Service::DeliverRewards(Member& member, PartyWorld& mailbox, TradeDesk::Res
         result.log.append(QStringLiteral("invasion rewards %1: %2")
                               .arg(QString::fromStdString(member.lobby), QString::fromStdString(line)));
     }
-    if (grants.changed && mailbox.store) {
-        writer->SaveTrades(mailbox.store->Folder(), mailbox.trades.Stored());
-    }
+    return true;
 }
 
 void Service::ResumeRewards(Member& member, qint64 now_ms, Result& result) {
-    const QString name = RewardFolder(member);
-    // A login never creates an empty mailbox. The first completed victory creates it.
-    if (!worlds.contains(name) && (folder.isEmpty() || !LoadWorld(name, now_ms, result))) {
-        return;
+    if (PartyWorld* mailbox = RewardMailbox(member, false, now_ms, result)) {
+        TradeDesk staged = mailbox->trades;
+        auto grants = staged.Resume(member.lobby, now_ms);
+        DeliverRewards(member, *mailbox, std::move(staged), std::move(grants), now_ms, result);
     }
-    PartyWorld& mailbox = worlds.at(name);
-    DeliverRewards(member, mailbox, mailbox.trades.Resume(member.lobby, now_ms), now_ms, result);
 }
 
-void Service::RewardInvasion(Member& winner, quint64 invasion, const std::string& defeated,
+bool Service::RewardInvasion(Member& winner, quint64 invasion, const std::string& defeated,
                              std::uint32_t echoes, std::uint32_t covenant_effect,
                              qint64 now_ms, Result& result) {
     if (!winner.invasion_rewards || winner.lobby.empty()) {
         result.log.append(QStringLiteral("invasions: victory %1 has no reward-capable winner")
                               .arg(invasion));
-        return;
+        return true; // no opted-in payment is owed
     }
-    const QString name = RewardFolder(winner);
-    if (!RoomFor(name, now_ms, result)) {
-        result.log.append(QStringLiteral("invasions: no room for victory %1's reward mailbox")
-                              .arg(invasion));
-        return;
-    }
-    PartyWorld& mailbox = WorldFor(name, now_ms, result);
-    DeliverRewards(winner, mailbox,
-                   mailbox.trades.InvasionVictory(winner.lobby, invasion, defeated, echoes,
-                       winner.covenant_rewards && covenant_effect == CorruptionCovenantEffect),
-                   now_ms, result);
+    PartyWorld* mailbox = RewardMailbox(winner, true, now_ms, result);
+    if (!mailbox) return false;
+    TradeDesk staged = mailbox->trades;
+    auto grants = staged.InvasionVictory(winner.lobby, invasion, defeated, echoes,
+                       winner.covenant_rewards && covenant_effect == CorruptionCovenantEffect);
+    return DeliverRewards(winner, *mailbox, std::move(staged), std::move(grants), now_ms, result);
 }
 
 QString Service::InvadedBy(quint64 link) const {

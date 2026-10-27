@@ -234,6 +234,7 @@ struct Game {
       ++owner_messages;
     } else if (IsTradeMessage(envelope)) {
       if (envelope.has_trade_grant()) {
+        if (on_grant) on_grant(envelope.trade_grant());
         grants.push_back(envelope.trade_grant());
       }
       TradeClient::Taken taken = trades.Take(envelope);
@@ -241,7 +242,7 @@ struct Game {
         added.push_back(std::move(items));
       }
       for (const bbcoop::Envelope &reply : taken.replies) {
-        Send(reply, now_ms);
+        if (ack_trades) Send(reply, now_ms);
       }
     } else if (envelope.has_welcome()) {
       welcome = envelope.welcome();
@@ -303,6 +304,8 @@ struct Game {
   u32 covenant_effect = 0;
   std::vector<bbcoop::TradeGrant> grants;
   TradeClient trades;
+  bool ack_trades = true;
+  std::function<void(const bbcoop::TradeGrant&)> on_grant;
   std::vector<TradeItems> added; // what its trades added
   u32 run = 0x1001;
   u32 number = 0;
@@ -3590,6 +3593,122 @@ int ExtendedCovenantGrantsWaitForACapableReconnect() {
   return 0;
 }
 
+int RewardPublicationAndAckAreDurableWithoutDrain() {
+  QTemporaryDir folder;
+  CHECK(folder.isValid());
+  const QString mailbox = QDir{folder.path()}.filePath(
+      BloodborneWorld::PartyFolderName(QByteArray{"invasion-rewards:"} + QByteArray{"rr"}.toHex()));
+  bool durable_at_delivery = false;
+  qint64 now = 0;
+  {
+    InvasionRig rig{true, true, folder.path()};
+    rig.EnableCovenants(0, CorruptionCovenantEffect);
+    rig.red.ack_trades = false;
+    rig.red.on_grant = [&](const bbcoop::TradeGrant& grant) {
+      const auto stored = BloodborneWorld::WorldStore{mailbox}.LoadTrades();
+      durable_at_delivery = stored && stored->next_id() == 2 && stored->grants_size() == 1 &&
+          stored->grants(0).grant().SerializeAsString() == grant.SerializeAsString();
+    };
+    CHECK(rig.Invade());
+    rig.a.Vitals(InvadedMap, 3, rig.now, 50, false, true);
+    rig.Step();
+    CHECK(rig.red.grants.size() == 1 && durable_at_delivery);
+    CHECK(!QFile::exists(QDir{mailbox}.filePath("world.pb"))); // trades-only mailbox
+    now = rig.now + 100;
+  }
+  // A crash after persistence and before an application ACK resumes the same grant/counter,
+  // without requiring unrelated world metadata to have survived.
+  Service restarted{folder.path()};
+  restarted.Load(now);
+  Game red{1002, "rr", 901};
+  red.invasion_rewards = red.covenant_rewards = true;
+  red.LobbyHello(true, now);
+  Pump(restarted, {&red}, now);
+  CHECK(red.grants.size() == 1 && red.added.size() == 1);
+  CHECK(red.grants.front().id() == (InvasionRewardGrantBit | 1));
+  const auto acked = BloodborneWorld::WorldStore{mailbox}.LoadTrades();
+  CHECK(acked && acked->next_id() == 2 && acked->grants_size() == 0); // no Drain
+  return 0;
+}
+
+int FailedRewardWritesPublishNothingAndPreserveAckState() {
+  QTemporaryDir folder;
+  CHECK(folder.isValid());
+  const QString mailbox = QDir{folder.path()}.filePath(
+      BloodborneWorld::PartyFolderName(QByteArray{"invasion-rewards:"} + QByteArray{"rr"}.toHex()));
+  BloodborneWorld::WorldStore store{mailbox};
+  TradeDesk initial;
+  CHECK(store.SaveTrades(initial.Stored()));
+  InvasionRig rig{true, true, folder.path()};
+  rig.EnableCovenants(0, CorruptionCovenantEffect); // loads the valid empty mailbox
+  rig.red.ack_trades = false;
+  CHECK(rig.Invade());
+  const QString ledger = QDir{mailbox}.filePath("trades.pb");
+  CHECK(QFile::remove(ledger));
+  CHECK(QDir{}.mkpath(ledger)); // atomic replacement cannot replace a directory
+  rig.a.Vitals(InvadedMap, 3, rig.now, 50, false, true);
+  rig.Step();
+  CHECK(rig.red.grants.empty() && !EndedFor(rig.red, bbcoop::InvasionEnd::TARGET_KILLED));
+  CHECK(!rig.service.VisitingOf(rig.red.endpoint).isEmpty());
+  CHECK(QDir{}.rmdir(ledger));
+  rig.a.Vitals(InvadedMap, 3, rig.now + 100, 50, false, true);
+  rig.Step(100);
+  CHECK(rig.red.grants.empty()); // bounded failure backoff, even after the disk recovers
+  rig.a.Vitals(InvadedMap, 3, rig.now + 1000, 50, false, true);
+  rig.Step(1000);
+  CHECK(rig.red.grants.size() == 1 && EndedFor(rig.red, bbcoop::InvasionEnd::TARGET_KILLED));
+  CHECK(store.LoadTrades()->next_id() == 2); // failed attempt did not publish/reuse an observed id
+  const QString saved = ledger + ".saved";
+  CHECK(QFile::rename(ledger, saved));
+  CHECK(QDir{}.mkpath(ledger));
+  bbcoop::Envelope ack;
+  ack.mutable_trade_granted()->set_id(InvasionRewardGrantBit | 1);
+  rig.red.Send(ack, rig.now);
+  rig.Step(); // failed ACK persistence must leave the confirmed in-memory grant pending
+  CHECK(QDir{}.rmdir(ledger));
+  CHECK(QFile::rename(saved, ledger));
+  rig.red.invasion_rewards = false;
+  rig.red.LobbyHello(true, rig.now + 1000);
+  rig.Step(1000);
+  rig.red.invasion_rewards = true;
+  rig.red.ack_trades = true;
+  rig.red.LobbyHello(true, rig.now);
+  rig.Step();
+  CHECK(rig.red.grants.size() == 2); // replay proves failed ACK did not erase current memory
+  CHECK(rig.red.added.size() == 1); // duplicate application is suppressed
+  const auto complete = store.LoadTrades();
+  CHECK(complete && complete->next_id() == 2 && complete->grants_size() == 0);
+  return 0;
+}
+
+int CorruptRewardLedgerNeverResetsItsCounter() {
+  QTemporaryDir folder;
+  CHECK(folder.isValid());
+  const QString mailbox = QDir{folder.path()}.filePath(
+      BloodborneWorld::PartyFolderName(QByteArray{"invasion-rewards:"} + QByteArray{"rr"}.toHex()));
+  CHECK(QDir{}.mkpath(mailbox));
+  QFile ledger{QDir{mailbox}.filePath("trades.pb")};
+  CHECK(ledger.open(QIODevice::WriteOnly));
+  const QByteArray corrupt = "not-a-protobuf-ledger";
+  CHECK(ledger.write(corrupt) == corrupt.size());
+  ledger.close();
+  InvasionRig rig{true, true, folder.path()};
+  rig.EnableCovenants(0, CorruptionCovenantEffect);
+  CHECK(rig.Invade());
+  rig.a.Vitals(InvadedMap, 3, rig.now, 50, false, true);
+  rig.Step();
+  CHECK(rig.red.grants.empty());
+  CHECK(ledger.open(QIODevice::ReadOnly));
+  CHECK(ledger.readAll() == corrupt); // never overwritten with a fresh next_id=1
+  ledger.close();
+  CHECK(ledger.open(QIODevice::WriteOnly | QIODevice::Truncate));
+  ledger.close(); // an empty protobuf parses, but its absent/zero counter is not a ledger
+  rig.a.Vitals(InvadedMap, 3, rig.now + 1000, 50, false, true);
+  rig.Step(1000);
+  CHECK(rig.red.grants.empty() && ledger.size() == 0);
+  return 0;
+}
+
 int AnInvasionLivesWithTheCapsAndTheCollector() {
   {
     BloodborneWorld::Limits limits;
@@ -3903,6 +4022,9 @@ int main() {
        VictoryRewardsUseSoloMailboxesAndSurviveRestart},
       {"CovenantRewardsFollowFrozenNativeOaths", CovenantRewardsFollowFrozenNativeOaths},
       {"ExtendedCovenantGrantsWaitForACapableReconnect", ExtendedCovenantGrantsWaitForACapableReconnect},
+      {"RewardPublicationAndAckAreDurableWithoutDrain", RewardPublicationAndAckAreDurableWithoutDrain},
+      {"FailedRewardWritesPublishNothingAndPreserveAckState", FailedRewardWritesPublishNothingAndPreserveAckState},
+      {"CorruptRewardLedgerNeverResetsItsCounter", CorruptRewardLedgerNeverResetsItsCounter},
       {"AnInvasionLivesWithTheCapsAndTheCollector",
        AnInvasionLivesWithTheCapsAndTheCollector},
       {"AForgottenHostedWorldIsRestoredToItsPlayer",

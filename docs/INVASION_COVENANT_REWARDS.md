@@ -63,8 +63,8 @@ A pending extended grant is withheld whole when an older client reconnects; it s
 its authenticated mailbox and is replayed when a covenant-capable client signs in. A capability
 upgrade on the same connection also resumes it. The mailbox does not discard or partially pay
 an extended grant to accommodate an old validator. The client owns applying and durably saving
-its payment before acknowledging; this server change does not itself make inventory/save writes
-atomic.
+its payment before acknowledging; see the server commit boundary below. Client inventory/save
+atomicity is a separate implementation and must be tested in the game.
 
 Only the existing joined victory endings pay. Cancellation, environment death of the host,
 party wipe, boss, timeout, disconnect, search cancellation and pre-join death remain unpaid.
@@ -86,3 +86,33 @@ A defending reward belongs to the session host, and a target-kill reward require
 - Grimrukh: [Soulstruct's Bloodborne EMEVD definitions](https://github.com/Grimrukh/soulstruct/blob/main/src/soulstruct/bloodborne/events/emevd/emedf.py),
   consulted to corroborate event instruction aliases; the actual reward rows/calls above come
   from the supplied game's original assets and native code.
+
+## Durable server commit boundary
+
+A new reward and its next grant counter are staged in a copy of the confirmed mailbox. A
+synchronous completion task enters the same FIFO `WorldWriter` queue as older asynchronous
+snapshots, so none of those snapshots can overwrite a newer confirmed reward or ACK afterward.
+The writer checks the full write, explicitly flushes and fsyncs the temporary file, commits its
+atomic rename, then fsyncs the containing directory and ancestors (including newly initialized
+mailbox parents). Direct overwrite fallback remains disabled. Only a successful completion
+publishes the new mailbox state and queues the grant to the client. ACK removal follows the
+same boundary, retaining the prior confirmed in-memory grant on failure.
+
+The existing authenticated `trades.pb` ledger is sufficient to load a mailbox after restart;
+`world.pb` is not a prerequisite. A present unreadable ledger, including an invalid zero/high-bit
+counter, fails closed instead of becoming a fresh counter. A failed new payment sends nothing
+and keeps the frozen invasion entitlement active for a later dead-Vitals retry, with a one-second
+failure backoff. In-memory-only server configurations have no disk durability guarantee.
+
+Focused tests check durable bytes during the actual grant-delivery callback, before any Drain;
+process-stop/restart with no world file; queued older snapshots before a durable ACK; failures
+before file sync, before rename, after rename, and after directory sync; failed grant publication;
+failed ACK retention/retry; and corrupt-ledger preservation. These are controlled process/fault
+fixtures, not physical power-cut tests. Durability depends on the filesystem/storage honoring
+successful fsync calls. The checked path was built/tested on the deployed Linux ARM64 platform;
+Windows directory flush support is not claimed as tested.
+
+The distinction follows [Qt's QSaveFile atomic replacement contract](https://doc.qt.io/qt-6/qsavefile.html)
+and the [Linux man-pages fsync directory requirement](https://man7.org/linux/man-pages/man2/fsync.2.html)
+(Linux man-pages project contributors; Michael Kerrisk). Original Kaniel/lKaniel, Vitalii Shevchuk
+and shadNet source attribution remains above and in every implementation commit.

@@ -14,6 +14,7 @@
 // share out of the log.
 #pragma once
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -60,7 +61,10 @@ public:
     bool Compact(const bbcoop::StoredWorld& world, const QDate& today = QDate::currentDate());
     // The party's trades (trades.pb, coop/trade.h), written whole on every change.
     std::optional<bbcoop::StoredTrades> LoadTrades() const;
-    bool SaveTrades(const bbcoop::StoredTrades& trades);
+    // Fault checkpoints let focused storage tests stop before/after the commit boundary.
+    enum class TradesWritePoint { BeforeFileSync, BeforeRename, AfterRename, AfterDirectorySync };
+    using TradesWriteCheck = std::function<bool(TradesWritePoint)>;
+    bool SaveTrades(const bbcoop::StoredTrades& trades, const TradesWriteCheck& check = {});
     const QString& Folder() const {
         return folder;
     }
@@ -88,6 +92,9 @@ public:
     void Compact(const QString& folder, bbcoop::StoredWorld world,
                  const QDate& today = QDate::currentDate());
     void SaveTrades(const QString& folder, bbcoop::StoredTrades trades);
+    // Queue behind all older snapshots, then wait for checked file+directory durability.
+    bool SaveTradesDurable(const QString& folder, bbcoop::StoredTrades trades,
+                          WorldStore::TradesWriteCheck check = {});
     // A whole file (team_world.pb, worlds.pb), replaced at once (QSaveFile).
     void Save(const QString& path, QByteArray bytes);
     // team_world.pb in `dir`, with the backups before it and the day's (save-restore).
@@ -331,6 +338,7 @@ private:
         QString vitals_logged; // the members' states and the wipes, as last logged
         // Its trades (coop/trade.h): the offers held and the grants owed.
         BloodborneCoop::TradeDesk trades;
+        bool reward_mailbox = false; // trades.pb alone is authoritative; no world.pb dependency
         // Kaniel 2026-10-25: its duels (coop/duel.h), in memory only (about the games running).
         BloodborneCoop::DuelReferee duels;
         // Phase 5b: a team's world (its party key is a team's), from its host's reports; read
@@ -381,6 +389,7 @@ private:
         std::string display; // its lobby hello's name (as players see it)
         bool invasion_rewards = false; // LobbyHello's explicit extension capability
         bool covenant_rewards = false; // can consume the extra Blood Dreg reward item
+        qint64 reward_retry_ms = 0; // disk failure backoff; never spin on dead Vitals
         std::uint32_t covenant_effect = 0; // normalized native oath marker, last vitals
     };
     // Invasions: one invader on its way to (or in) a team world.
@@ -535,9 +544,10 @@ private:
     // solo invaders have no party Hello. Its grants use InvasionRewardGrantBit for safe ACKs.
     QString RewardFolder(const Member& member) const;
     void ResumeRewards(Member& member, qint64 now_ms, Result& result);
-    void DeliverRewards(Member& member, PartyWorld& mailbox,
+    PartyWorld* RewardMailbox(Member& member, bool create, qint64 now_ms, Result& result);
+    bool DeliverRewards(Member& member, PartyWorld& mailbox, BloodborneCoop::TradeDesk staged,
                         BloodborneCoop::TradeDesk::Result grants, qint64 now_ms, Result& result);
-    void RewardInvasion(Member& winner, quint64 invasion, const std::string& defeated,
+    bool RewardInvasion(Member& winner, quint64 invasion, const std::string& defeated,
                         std::uint32_t echoes, std::uint32_t covenant_effect,
                         qint64 now_ms, Result& result);
     QString InvadedBy(quint64 link) const;

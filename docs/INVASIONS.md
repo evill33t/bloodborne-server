@@ -160,8 +160,9 @@ all but the Sinister bell, with the native kind/sign (the fallback behind
 
 The server issues a reward only for a **joined** invasion that it ends as `INVADER_DIED`
 (the defending session host wins), or `TARGET_KILLED` with the victim's
-`Vitals.killed_by_invader=true` (the invader wins). The record is removed before issuing the
-payment, so duplicate death/end reports cannot issue another reward. A notice cancelled before
+`Vitals.killed_by_invader=true` (the invader wins). The reward and next grant counter become
+durable before publication, and the invasion retires before another message is processed, so
+duplicate death/end reports cannot issue another reward. A notice cancelled before
 joining, environmental host death, party wipe, boss, timeout, disconnect, cancelled search, or
 turning invasions off never pays. Guests do not get the host's defending reward.
 
@@ -195,9 +196,10 @@ clients supply no mailbox key. It is never the invaded team's world. A party-fre
 receive and acknowledge a reward; its high-bit ACK is intercepted before hostile/party routing.
 An ACK from another authenticated identity cannot clear that mailbox. Pending grants and the
 next grant counter survive restart in `trades.pb`. A successful capable lobby hello resends
-pending grants; a legacy hello preserves them without sending them. The existing grant safety
-boundary remains: replay is once per **game run**, not an atomic transaction across a game crash
-between saving its inventory and acknowledging the grant.
+pending grants; a legacy hello preserves them without sending them. The server now confirms
+file and directory durability through the ordered writer before publishing a grant or ACK removal;
+see [the durable server boundary](INVASION_COVENANT_REWARDS.md#durable-server-commit-boundary).
+Client inventory/save transaction behavior remains a separate client responsibility.
 
 Both refused offers and late/mismatched answers now refund only valid ordinary items. The old
 "return whatever the client claimed" behavior could launder an unknown kind into an application
