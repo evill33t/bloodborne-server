@@ -380,6 +380,8 @@ private:
         bool boss = false;
         std::string display; // its lobby hello's name (as players see it)
         bool invasion_rewards = false; // LobbyHello's explicit extension capability
+        bool covenant_rewards = false; // can consume the extra Blood Dreg reward item
+        std::uint32_t covenant_effect = 0; // normalized native oath marker, last vitals
     };
     // Invasions: one invader on its way to (or in) a team world.
     struct Invasion {
@@ -389,6 +391,8 @@ private:
         std::string target;       // the member it hunts: the session's host
         std::uint32_t invader_level = 0; // frozen at match; never the death report's level
         std::uint32_t target_level = 0;  // frozen at join
+        std::uint32_t invader_covenant = 0; // frozen at match, from the invasion request
+        std::uint32_t target_covenant = 0;  // frozen at join, never the death report's oath
         qint64 matched_ms = 0;
         bool joined = false;
         qint64 joined_ms = 0;
@@ -400,6 +404,7 @@ private:
     struct Search {
         std::uint32_t level = 0;
         qint64 since_ms = 0;
+        std::uint32_t covenant_effect = 0;
     };
 
     PartyWorld& WorldFor(const QString& name, qint64 now_ms, Result& result);
@@ -533,7 +538,8 @@ private:
     void DeliverRewards(Member& member, PartyWorld& mailbox,
                         BloodborneCoop::TradeDesk::Result grants, qint64 now_ms, Result& result);
     void RewardInvasion(Member& winner, quint64 invasion, const std::string& defeated,
-                        std::uint32_t echoes, qint64 now_ms, Result& result);
+                        std::uint32_t echoes, std::uint32_t covenant_effect,
+                        qint64 now_ms, Result& result);
     QString InvadedBy(quint64 link) const;
     // An invasion's link gone: its own (the invader's) or its target's host's.
     void InvasionLinkGone(quint64 link, qint64 now_ms, Result& result);

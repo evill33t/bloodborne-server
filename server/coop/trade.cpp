@@ -102,20 +102,24 @@ std::optional<std::string> TradeGrantItemsProblem(const bbcoop::TradeGrant& gran
         return TradeItemsProblem(items, false);
     }
     if (reason != TradeGrantReason::InvasionReward ||
-        (grant.id() & InvasionRewardGrantBit) == 0 || items.empty() || items.size() > 2) {
+        (grant.id() & InvasionRewardGrantBit) == 0 || items.empty() || items.size() > 3) {
         return "not a known server grant";
     }
     bool insight = false;
     bool echoes = false;
+    bool blood_dreg = false;
     for (const TradeItem& item : items) {
-        if (item.id != 0 || !item.name.empty() || !item.data.empty()) {
+        if (!item.name.empty() || !item.data.empty()) {
             return "not an invasion reward";
         }
-        if (item.kind == TradeItemKind::Insight && item.count == 1 && !insight) {
+        if (item.kind == TradeItemKind::Insight && item.id == 0 && item.count == 1 && !insight) {
             insight = true;
-        } else if (item.kind == TradeItemKind::Echoes && item.count > 0 &&
+        } else if (item.kind == TradeItemKind::Echoes && item.id == 0 && item.count > 0 &&
                    item.count <= MaxTradeEchoes && !echoes) {
             echoes = true;
+        } else if (item.kind == TradeItemKind::Goods && item.id == BloodDregGoods &&
+                   item.count == 1 && !blood_dreg) {
+            blood_dreg = true;
         } else {
             return "not an invasion reward";
         }
@@ -427,11 +431,15 @@ TradeDesk::Result TradeDesk::Answer(const std::string& member, const bbcoop::Tra
 }
 
 TradeDesk::Result TradeDesk::InvasionVictory(const std::string& member, u64 invasion,
-                                            const std::string& defeated, u32 echoes) {
+                                            const std::string& defeated, u32 echoes,
+                                            bool blood_dreg) {
     Result result;
     TradeItems items{{TradeItemKind::Insight, 0, 1}};
     if (echoes > 0 && echoes <= MaxTradeEchoes) {
         items.push_back({TradeItemKind::Echoes, 0, echoes});
+    }
+    if (blood_dreg) {
+        items.push_back({TradeItemKind::Goods, BloodDregGoods, 1});
     }
     Grant(result, member, invasion, defeated, "Invasion victory", std::move(items),
           TradeGrantReason::InvasionReward);

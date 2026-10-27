@@ -48,7 +48,7 @@ enum class TradeState : u32 {
 enum class TradeGrantReason : u32 {
     Received = 0, // the other member's part of a trade
     Returned = 1, // the member's own items back
-    InvasionReward = 2, // server-issued victory: one Insight and optional Blood Echoes
+    InvasionReward = 2, // server victory: Insight, optional Echoes and covenant Blood Dreg
 };
 
 struct TradeItem {
@@ -65,6 +65,7 @@ using TradeItems = std::vector<TradeItem>;
 // own (weapons, armor, gems and runes), each with its data. Item categories as the game's item ids
 // carry them (the top 4 bits).
 constexpr u32 BloodVialGoods = 1000;
+constexpr u32 BloodDregGoods = 704; // original ItemLotParam 5500/5510, one for Corruption victories
 constexpr u32 QuicksilverBulletGoods = 900;
 // Reward mailboxes use the high bit, so their acknowledgements cannot consume a party's trade.
 constexpr u64 InvasionRewardGrantBit = u64{1} << 63;
@@ -156,7 +157,7 @@ public:
     Result Granted(const std::string& member, u64 grant);
     // Server-only victory payment, persisted and replayed by the normal grant/ack machinery.
     Result InvasionVictory(const std::string& member, u64 invasion,
-                           const std::string& defeated, u32 echoes);
+                           const std::string& defeated, u32 echoes, bool blood_dreg = false);
     // Offers past their time, back to their givers.
     Result Expire(s64 now_ms);
     // A member's game said hello (a new run): what it is owed again, its grants and the offers

@@ -606,6 +606,45 @@ int TestServerOnlyRewardsAndRefundSafety() {
   return 0;
 }
 
+int TestCovenantGrantShapeIsNarrow() {
+  TradeDesk desk;
+  const auto paid = desk.InvasionVictory("red", 7, "host", 48, true);
+  CHECK(paid.sends.size() == 1);
+  const auto& grant = paid.sends.front().envelope.trade_grant();
+  CHECK(!TradeGrantItemsProblem(grant));
+  CHECK(grant.items_size() == 3);
+  CHECK((TradeItemsOf(grant.items()) == TradeItems{
+      {TradeItemKind::Insight, 0, 1}, Echoes(48), {TradeItemKind::Goods, BloodDregGoods, 1}}));
+  for (const u32 id : {0u, 705u, 1700u, 1000u, 0xffffffffu}) {
+    auto forged = grant;
+    forged.mutable_items(2)->set_id(id);
+    CHECK(TradeGrantItemsProblem(forged).has_value());
+  }
+  for (const u32 count : {0u, 2u, 99u}) {
+    auto forged = grant;
+    forged.mutable_items(2)->set_count(count);
+    CHECK(TradeGrantItemsProblem(forged).has_value());
+  }
+  auto forged = grant;
+  forged.mutable_items(2)->set_data("not a reward payload");
+  CHECK(TradeGrantItemsProblem(forged).has_value());
+  forged = grant;
+  forged.mutable_items(2)->set_name("Blood Dreg");
+  CHECK(TradeGrantItemsProblem(forged).has_value());
+  forged = grant;
+  *forged.mutable_items(1) = forged.items(2); // two Dregs, even within the maximum three items
+  CHECK(TradeGrantItemsProblem(forged).has_value());
+  forged = grant;
+  forged.mutable_items()->DeleteSubrange(0, 1); // no Insight
+  CHECK(TradeGrantItemsProblem(forged).has_value());
+  TradeClient client;
+  CHECK(client.Take(paid.sends.front().envelope).add.size() == 1);
+  CHECK(client.Take(paid.sends.front().envelope).add.empty());
+  // It remains an ordinary legitimate goods item too; no regression to the original any-item trade.
+  CHECK(!TradeItemsProblem(TradeItems{{TradeItemKind::Goods, BloodDregGoods, 1}}, false));
+  return 0;
+}
+
 int TestEchoesPicker() {
   // Blood Echoes go in round steps that fit what the player holds: under a
   // hundred presses to any of them, all of them past the last (Kaniel
@@ -637,6 +676,7 @@ int main() {
   failed += TestItems();
   failed += TestEchoesPicker();
   failed += TestServerOnlyRewardsAndRefundSafety();
+  failed += TestCovenantGrantShapeIsNarrow();
   failed += TestAnyItemGiven();
   failed += TestGiveAccepted();
   failed += TestSwap();

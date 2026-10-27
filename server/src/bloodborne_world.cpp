@@ -1357,6 +1357,7 @@ void Service::TakeBoard(Member& member, PartyWorld& world, const bbcoop::Envelop
         return;
     case bbcoop::Envelope::kVitals: {
         member.level = envelope.vitals().level();
+        member.covenant_effect = NormalizeCovenantEffect(envelope.vitals().covenant_effect());
         member.boss = envelope.vitals().boss();
         std::uint32_t wipe_before = 0;
         if (invasions.contains(world.name)) {
@@ -1640,6 +1641,7 @@ Service::Result Service::Receive(const ServerLink::Endpoint& from, const QByteAr
                               .arg(QString::fromStdString(Who(member))));
         member.party.clear();
         member.invasion_rewards = false; // renegotiate before sending an extension to a new game
+        member.covenant_rewards = false;
         // An invader's game that started over is home: its invasion is over.
         searches.erase(member.key);
         if (const QString invaded = InvadedBy(member.key); !invaded.isEmpty()) {
@@ -2182,7 +2184,10 @@ void Service::OnLobbyHello(Member& member, const bbcoop::LobbyHello& hello, qint
     member.lobby = hello.member();
     member.display = hello.name();
     const bool rewards_before = std::exchange(member.invasion_rewards, hello.invasion_rewards());
-    if (member.invasion_rewards && (arrived || !rewards_before)) {
+    const bool covenants_before = std::exchange(member.covenant_rewards,
+                                                hello.invasion_rewards() && hello.covenant_rewards());
+    if (member.invasion_rewards &&
+        (arrived || !rewards_before || (!covenants_before && member.covenant_rewards))) {
         ResumeRewards(member, now_ms, result);
     }
     if (arrived) {
@@ -2845,7 +2850,8 @@ void Service::OnInvadeRequest(Member& member, const bbcoop::InvadeRequest& reque
             QStringLiteral("invasions: %1 refused: %2").arg(who, QString::fromStdString(refused)));
         return;
     }
-    searches[member.key] = {request.level(), now_ms};
+    searches[member.key] = {request.level(), now_ms,
+                            NormalizeCovenantEffect(request.covenant_effect())};
     result.log.append(
         QStringLiteral("invasions: %1 (level %2) looks for a world").arg(who).arg(request.level()));
     Match(now_ms, result);
@@ -2860,6 +2866,7 @@ void Service::TakeHostile(Member& member, const bbcoop::Envelope& envelope, qint
         return;
     case bbcoop::Envelope::kVitals: {
         member.level = envelope.vitals().level();
+        member.covenant_effect = NormalizeCovenantEffect(envelope.vitals().covenant_effect());
         if (envelope.vitals().vital() == 3 && !invaded.isEmpty()) { // Vital: dead
             EndInvasion(invaded, bbcoop::InvasionEnd::INVADER_DIED, now_ms, result);
             return;
@@ -2958,6 +2965,7 @@ void Service::Match(qint64 now_ms, Result& result) {
         invasion.invader_name = invader.lobby;
         invasion.target = world.session->host();
         invasion.invader_level = search->second.level;
+        invasion.invader_covenant = search->second.covenant_effect;
         invasion.matched_ms = now_ms;
         bbcoop::Envelope notice;
         notice.mutable_invasion_notice()->set_id(invasion.id);
@@ -3026,6 +3034,7 @@ void Service::JoinInvasion(PartyWorld& world, Invasion& invasion, qint64 now_ms,
             if (member.name == invasion.target) {
                 message.set_map(member.map);
                 invasion.target_level = member.level;
+                invasion.target_covenant = member.covenant_effect;
             }
             SendTo(member, joined, now_ms);
         }
@@ -3049,13 +3058,15 @@ void Service::EndInvasion(const QString& world, bbcoop::InvasionEnd::Reason reas
             if (reason == bbcoop::InvasionEnd::INVADER_DIED && member.party == world &&
                 member.name == invasion.target && !member.hostile) {
                 RewardInvasion(member, invasion.id, invasion.invader_name,
-                               InvasionVictoryEchoes(invasion.invader_level, false), now_ms, result);
+                               InvasionVictoryEchoes(invasion.invader_level, false),
+                               invasion.target_covenant, now_ms, result);
                 break;
             }
             if (reason == bbcoop::InvasionEnd::TARGET_KILLED && killed_by_invader &&
                 member.key == invasion.invader) {
                 RewardInvasion(member, invasion.id, invasion.target,
-                               InvasionVictoryEchoes(invasion.target_level, true), now_ms, result);
+                               InvasionVictoryEchoes(invasion.target_level, true),
+                               invasion.invader_covenant, now_ms, result);
                 break;
             }
         }
@@ -3121,7 +3132,14 @@ QString Service::RewardFolder(const Member& member) const {
 void Service::DeliverRewards(Member& member, PartyWorld& mailbox, TradeDesk::Result grants,
                              qint64 now_ms, Result& result) {
     for (const TradeDesk::Send& send : grants.sends) {
-        if (send.to == member.lobby && member.invasion_rewards) {
+        const bool needs_covenant = send.envelope.has_trade_grant() &&
+            std::ranges::any_of(send.envelope.trade_grant().items(), [](const auto& item) {
+                return item.kind() == static_cast<u32>(TradeItemKind::Goods);
+            });
+        // A legacy reward client cannot validate the extended shape. Keep the whole durable
+        // grant for its next capable login rather than partially paying or dropping the Dreg.
+        if (send.to == member.lobby && member.invasion_rewards &&
+            (!needs_covenant || member.covenant_rewards)) {
             SendTo(member, send.envelope, now_ms);
         }
     }
@@ -3145,7 +3163,8 @@ void Service::ResumeRewards(Member& member, qint64 now_ms, Result& result) {
 }
 
 void Service::RewardInvasion(Member& winner, quint64 invasion, const std::string& defeated,
-                             std::uint32_t echoes, qint64 now_ms, Result& result) {
+                             std::uint32_t echoes, std::uint32_t covenant_effect,
+                             qint64 now_ms, Result& result) {
     if (!winner.invasion_rewards || winner.lobby.empty()) {
         result.log.append(QStringLiteral("invasions: victory %1 has no reward-capable winner")
                               .arg(invasion));
@@ -3159,7 +3178,8 @@ void Service::RewardInvasion(Member& winner, quint64 invasion, const std::string
     }
     PartyWorld& mailbox = WorldFor(name, now_ms, result);
     DeliverRewards(winner, mailbox,
-                   mailbox.trades.InvasionVictory(winner.lobby, invasion, defeated, echoes),
+                   mailbox.trades.InvasionVictory(winner.lobby, invasion, defeated, echoes,
+                       winner.covenant_rewards && covenant_effect == CorruptionCovenantEffect),
                    now_ms, result);
 }
 

@@ -145,6 +145,7 @@ struct Game {
     envelope.mutable_lobby_hello()->set_name("Player " + name);
     envelope.mutable_lobby_hello()->set_playing(playing);
     envelope.mutable_lobby_hello()->set_invasion_rewards(invasion_rewards);
+    envelope.mutable_lobby_hello()->set_covenant_rewards(covenant_rewards);
     Send(envelope, now_ms);
   }
   void Team(bbcoop::TeamRequest::Action action, qint64 now_ms,
@@ -163,6 +164,7 @@ struct Game {
     bbcoop::Envelope envelope;
     envelope.mutable_invade_request()->set_level(level);
     envelope.mutable_invade_request()->set_cancel(cancel);
+    envelope.mutable_invade_request()->set_covenant_effect(covenant_effect);
     Send(envelope, now_ms);
   }
   void Vitals(u32 map, u32 vital, qint64 now_ms, u32 level = 0,
@@ -175,6 +177,7 @@ struct Game {
     envelope.mutable_vitals()->set_level(level);
     envelope.mutable_vitals()->set_boss(boss);
     envelope.mutable_vitals()->set_killed_by_invader(killed_by_invader);
+    envelope.mutable_vitals()->set_covenant_effect(covenant_effect);
     envelope.mutable_vitals()->mutable_at()->set_x(1);
     Send(envelope, now_ms);
   }
@@ -296,6 +299,8 @@ struct Game {
   }
   bool enemy_owner = true; // runs phase 4's owners (its hello says)
   bool invasion_rewards = false;
+  bool covenant_rewards = false;
+  u32 covenant_effect = 0;
   std::vector<bbcoop::TradeGrant> grants;
   TradeClient trades;
   std::vector<TradeItems> added; // what its trades added
@@ -2762,6 +2767,17 @@ struct InvasionRig {
     }
     Step();
   }
+  void EnableCovenants(u32 host_oath, u32 invader_oath) {
+    a.covenant_effect = host_oath;
+    red.covenant_effect = invader_oath;
+    for (Game* game : games) {
+      game->invasion_rewards = true;
+      game->covenant_rewards = true;
+      game->LobbyHello(true, now);
+    }
+    a.Vitals(InvadedMap, 1, now, 50);
+    Step();
+  }
   void Allow(bool allow) {
     bbcoop::Envelope envelope;
     envelope.mutable_team_request()->set_action(bbcoop::TeamRequest::INVADERS);
@@ -3476,6 +3492,104 @@ int VictoryRewardsUseSoloMailboxesAndSurviveRestart() {
   return 0;
 }
 
+int CovenantRewardsFollowFrozenNativeOaths() {
+  CHECK(NormalizeCovenantEffect(6100) == CorruptionCovenantEffect);
+  CHECK(NormalizeCovenantEffect(6110) == RadianceCovenantEffect);
+  CHECK(NormalizeCovenantEffect(6120) == HunterCovenantEffect);
+  CHECK(NormalizeCovenantEffect(6130) == BloodAddledHunterCovenantEffect);
+  CHECK(NormalizeCovenantEffect(12345) == 0);
+  CHECK(NormalizeCovenantEffect(0xffffffff) == 0);
+  // Native lots 5500/5510 contain one Dreg; 5600/5610/5700/5710/5800/5810 are empty.
+  for (const u32 effect : {0u, 6100u, 6110u, 6120u, 6130u, 12345u}) {
+    for (const bool host_wins : {true, false}) {
+      InvasionRig rig;
+      rig.EnableCovenants(effect, effect);
+      CHECK(rig.Invade());
+      // Neither swapping out a Corruption rune nor swapping one in mid-visit changes rewards.
+      rig.a.covenant_effect = effect == 6100 ? 0 : 6100;
+      rig.red.covenant_effect = rig.a.covenant_effect;
+      rig.a.Vitals(InvadedMap, 1, rig.now, 50);
+      rig.red.Vitals(InvadedMap, 1, rig.now, 60);
+      rig.Step();
+      if (host_wins) {
+        rig.red.Vitals(InvadedMap, 3, rig.now, 60);
+      } else {
+        rig.a.Vitals(InvadedMap, 3, rig.now, 50, false, true);
+      }
+      rig.Step();
+      const auto& winner = host_wins ? rig.a : rig.red;
+      const auto& loser = host_wins ? rig.red : rig.a;
+      CHECK(winner.grants.size() == 1 && loser.grants.empty() && rig.b.grants.empty());
+      const auto& grant = winner.grants.front();
+      CHECK(!TradeGrantItemsProblem(grant));
+      const auto items = TradeItemsOf(grant.items());
+      CHECK(items.size() == (effect == 6100 ? 3 : 2));
+      const auto dregs = std::ranges::count_if(items, [](const TradeItem& item) {
+        return item.kind == TradeItemKind::Goods && item.id == BloodDregGoods && item.count == 1;
+      });
+      CHECK(dregs == (effect == 6100 ? 1 : 0));
+    }
+  }
+  // A reward-capable client without the covenant extension keeps the original two-item grant.
+  for (const bool host_wins : {true, false}) {
+    InvasionRig old;
+    old.EnableRewards();
+    old.a.covenant_effect = old.red.covenant_effect = CorruptionCovenantEffect;
+    old.a.Vitals(InvadedMap, 1, old.now, 50);
+    old.Step();
+    CHECK(old.Invade());
+    if (host_wins) old.red.Vitals(InvadedMap, 3, old.now, 60);
+    else old.a.Vitals(InvadedMap, 3, old.now, 50, false, true);
+    old.Step();
+    const auto& winner = host_wins ? old.a : old.red;
+    CHECK(winner.grants.size() == 1);
+    CHECK(winner.grants.front().items_size() == 2);
+  }
+  return 0;
+}
+
+int ExtendedCovenantGrantsWaitForACapableReconnect() {
+  QTemporaryDir folder;
+  CHECK(folder.isValid());
+  qint64 now = 0;
+  {
+    InvasionRig rig{true, true, folder.path()};
+    rig.EnableCovenants(RadianceCovenantEffect, CorruptionCovenantEffect);
+    CHECK(rig.Invade());
+    rig.red.deaf = true;
+    rig.a.Vitals(InvadedMap, 3, rig.now, 50, false, true);
+    rig.Step();
+    rig.service.Drain();
+    now = rig.now + 100;
+  }
+  {
+    Service service{folder.path()};
+    service.Load(now);
+    Game old{1002, "rr", 800};
+    old.invasion_rewards = true;
+    old.LobbyHello(true, now);
+    Pump(service, {&old}, now);
+    CHECK(old.grants.empty() && old.added.empty()); // old validator cannot accept a Dreg
+    old.covenant_rewards = true;
+    old.LobbyHello(true, now + 10);
+    Pump(service, {&old}, now + 10);
+    CHECK(old.grants.size() == 1 && old.added.size() == 1);
+    CHECK((old.added.front() == TradeItems{
+        {TradeItemKind::Insight, 0, 1}, {TradeItemKind::Echoes, 0, 1453},
+        {TradeItemKind::Goods, BloodDregGoods, 1}}));
+    CHECK(service.PartyOf(old.endpoint).isEmpty());
+    service.Drain();
+  }
+  Service after_ack{folder.path()};
+  after_ack.Load(now + 20);
+  Game again{1002, "rr", 801};
+  again.invasion_rewards = again.covenant_rewards = true;
+  again.LobbyHello(true, now + 20);
+  Pump(after_ack, {&again}, now + 20);
+  CHECK(again.grants.empty() && again.added.empty());
+  return 0;
+}
+
 int AnInvasionLivesWithTheCapsAndTheCollector() {
   {
     BloodborneWorld::Limits limits;
@@ -3787,6 +3901,8 @@ int main() {
        EachEndTellsEveryoneAndRestoresTheRouting},
       {"VictoryRewardsUseSoloMailboxesAndSurviveRestart",
        VictoryRewardsUseSoloMailboxesAndSurviveRestart},
+      {"CovenantRewardsFollowFrozenNativeOaths", CovenantRewardsFollowFrozenNativeOaths},
+      {"ExtendedCovenantGrantsWaitForACapableReconnect", ExtendedCovenantGrantsWaitForACapableReconnect},
       {"AnInvasionLivesWithTheCapsAndTheCollector",
        AnInvasionLivesWithTheCapsAndTheCollector},
       {"AForgottenHostedWorldIsRestoredToItsPlayer",

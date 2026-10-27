@@ -165,6 +165,9 @@ payment, so duplicate death/end reports cannot issue another reward. A notice ca
 joining, environmental host death, party wipe, boss, timeout, disconnect, cancelled search, or
 turning invasions off never pays. Guests do not get the host's defending reward.
 
+A covenant-capable Corruption winner additionally receives one Blood Dreg, from the original
+native PvP reward lots. See [covenant rewards and primary evidence](INVASION_COVENANT_REWARDS.md).
+
 The payment is one Insight, plus Blood Echoes according to the explicit server policy in
 `InvasionVictoryEchoes`: 10% for an invading winner, 30% for a defending host, of
 `max(0, floor(0.02 L^3 + 3.06 L^2 + 105.6 L - 895))`. The defeated hunter's level is frozen at
@@ -179,8 +182,9 @@ kind. Opting in requires implementing all of the following:
 
 - `TradeItemKind::Insight=4`, id 0, count 1, empty name/data; it is server-issued and cannot be
   offered, requested, answered, refunded, or otherwise supplied by a client.
-- `TradeGrantReason::InvasionReward=2`; its exact item shape is one Insight plus at most one
-  ordinary Echoes item (kind 1, id 0, positive count). Other items/reasons are rejected.
+- `TradeGrantReason::InvasionReward=2`; its original item shape is one Insight plus at most one
+  ordinary Echoes item (kind 1, id 0, positive count). Covenant-capable clients may additionally
+  receive one goods-704 Blood Dreg; other goods/items/reasons are rejected.
 - Reward grant IDs have bit 63 set. Ordinary party trade IDs do not. The client applies a valid
   grant once per run and sends `TradeGranted{id}` only after applying it.
 
@@ -207,4 +211,5 @@ Project contributors, [pinned server source](https://github.com/lKaniel/bloodbor
 and [invasion lifecycle](https://github.com/lKaniel/bloodborne-server/blob/8d5e54fee50e1d7c9dd25ba0a32f224b1d76b6f1/server/src/bloodborne_world.cpp).
 The durable reward mailbox, capability, validation and tests here extend those original
 GPL-2.0-or-later sources; they do not change their attribution or claim original authorship.
-Covenant-specific rewards and the Bell-Ringing Woman remain outside this change.
+Covenant-specific reward inventory is described in the linked follow-up; the Bell-Ringing Woman
+remains outside this change.
