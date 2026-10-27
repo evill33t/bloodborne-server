@@ -123,14 +123,6 @@ To restore one world on production: stop shadNet, then run
 `restore-aside/` (not next to the others, because shadNet takes any folder in
 `bloodborne_worlds/` as a world).
 
-## Scaling notes
-
-* One process, one Qt event loop for the UDP link/relay and the worlds. The journal `fsync`
-  runs on that loop, so put `/data` on local NVMe, not a network volume.
-* Each TCP client gets its own thread and its own SQLite connection (`server.cpp`,
-  `client_session.cpp`). That is why `pids_limit`/`TasksMax` are set to 4096.
-* Postgres and Redis are not needed for one machine. See docs/HOSTED_SERVER.md.
-
 ## Build provenance and optional focused tests
 
 The Docker context omits Git metadata and the optional bbport revision script. Pass
@@ -142,3 +134,11 @@ metadata only; it does not override release/protocol admission.
 focused suites in an optional builder target. The default runtime image keeps its
 existing contents. The original `--target loadtest` still packages bbload separately.
 These commands can be combined with the independent ARM64 toolchain change.
+
+## Scaling notes
+
+* One process, one Qt event loop for the UDP link/relay and the worlds. The journal `fsync`
+  runs on that loop, so put `/data` on local NVMe, not a network volume.
+* Each TCP client gets its own thread and its own SQLite connection (`server.cpp`,
+  `client_session.cpp`). That is why `pids_limit`/`TasksMax` are set to 4096.
+* Postgres and Redis are not needed for one machine. See docs/HOSTED_SERVER.md.
