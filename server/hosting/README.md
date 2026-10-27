@@ -130,3 +130,15 @@ To restore one world on production: stop shadNet, then run
 * Each TCP client gets its own thread and its own SQLite connection (`server.cpp`,
   `client_session.cpp`). That is why `pids_limit`/`TasksMax` are set to 4096.
 * Postgres and Redis are not needed for one machine. See docs/HOSTED_SERVER.md.
+
+## Build provenance and optional focused tests
+
+The Docker context omits Git metadata and the optional bbport revision script. Pass
+`--build-arg SOURCE_REVISION="$(git rev-parse HEAD)"` to label a build with its source
+revision. Omitting the argument retains CMake's existing fallback. This sets revision
+metadata only; it does not override release/protocol admission.
+
+`docker build --target tests -f server/hosting/Dockerfile .` builds and runs the ten
+focused suites in an optional builder target. The default runtime image keeps its
+existing contents. The original `--target loadtest` still packages bbload separately.
+These commands can be combined with the independent ARM64 toolchain change.
