@@ -109,8 +109,21 @@ process-stop/restart with no world file; queued older snapshots before a durable
 before file sync, before rename, after rename, and after directory sync; failed grant publication;
 failed ACK retention/retry; and corrupt-ledger preservation. These are controlled process/fault
 fixtures, not physical power-cut tests. Durability depends on the filesystem/storage honoring
-successful fsync calls. The checked path was built/tested on the deployed Linux ARM64 platform;
-Windows directory flush support is not claimed as tested.
+successful flush calls. The complete reward implementation passed the ten focused suites on
+Linux ARM64 and native Windows Server 2022 with MSVC and Qt 6.8.3. The
+[Windows validation run](https://github.com/evill33t/bloodborne-server/actions/runs/40559939580)
+includes the restart, durable delivery, ordered ACK and write-failure fixtures.
+
+On Windows, directory handles use `FILE_FLAG_BACKUP_SEMANTICS` and `GENERIC_WRITE`.
+A native probe reproduced `ERROR_ACCESS_DENIED` when flushing a read-only handle and successful
+flushes with write access. File and ancestor-directory open/flush failures remain failures:
+the server publishes no new reward or ACK state if filesystem support or access rights do not
+permit the required flushes. The Windows run validates API/process behavior on that runner;
+it does not certify physical power-loss behavior or every filesystem and permissions policy.
+The access requirement follows Microsoft's
+[FlushFileBuffers documentation](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers)
+and [CreateFile directory-handle flags](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
+(Microsoft and Microsoft Learn contributors).
 
 The distinction follows [Qt's QSaveFile atomic replacement contract](https://doc.qt.io/qt-6/qsavefile.html)
 and the [Linux man-pages fsync directory requirement](https://man7.org/linux/man-pages/man2/fsync.2.html)
