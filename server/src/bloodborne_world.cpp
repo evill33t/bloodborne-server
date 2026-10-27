@@ -110,8 +110,9 @@ bool SyncToDisk(QFileDevice& file) {
 // and its parent: the first reward may have just created the mailbox directory itself.
 bool SyncDirectory(const QString& path) {
 #ifdef Q_OS_WIN
+    // FlushFileBuffers requires write access, including for directory handles.
     const HANDLE handle = CreateFileW(reinterpret_cast<const wchar_t*>(path.utf16()),
-        GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (handle == INVALID_HANDLE_VALUE) return false;
     const bool ok = FlushFileBuffers(handle) != 0;
