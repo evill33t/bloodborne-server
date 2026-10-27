@@ -1,0 +1,41 @@
+name: Windows directory durability probe
+on:
+  push:
+    branches: [codex/validate-windows-durability]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-2022
+    steps:
+      - name: Check directory handle access on native Windows
+        shell: pwsh
+        run: |
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class Native {
+            [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+            public static extern IntPtr CreateFileW(string path, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+            [DllImport("kernel32.dll", SetLastError=true)]
+            public static extern bool FlushFileBuffers(IntPtr handle);
+            [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
+          }
+          '@
+          $root = Join-Path $env:RUNNER_TEMP ('directory-flush-' + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path "$root/new-parent/mailbox" -Force | Out-Null
+          foreach ($path in @("$root/new-parent/mailbox", "$root/new-parent", $root, (Split-Path $root))) {
+            foreach ($access in @([uint32]2147483648, [uint32]1073741824, [uint32]3221225472)) {
+              $h = [Native]::CreateFileW($path, $access, 7, [IntPtr]::Zero, 3, 33554432, [IntPtr]::Zero)
+              $openError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+              $flushed = $false; $flushError = 0
+              if ($h -ne [IntPtr](-1)) {
+                $flushed = [Native]::FlushFileBuffers($h)
+                $flushError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                [Native]::CloseHandle($h) | Out-Null
+              }
+              @{path=$path; access=$access; opened=($h -ne [IntPtr](-1)); openError=$openError; flushed=$flushed; flushError=$flushError} | ConvertTo-Json -Compress
+            }
+          }
+          Remove-Item -Recurse -Force $root
